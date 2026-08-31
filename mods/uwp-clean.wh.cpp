@@ -1,87 +1,312 @@
 // ==WindhawkMod==
-// @id              uwp-clean
-// @name            Clean up UWP processes
-// @description     Automatically end UWP processes when no UWP apps are open.
-// @version         0.1
-// @author          Alcatel
-// @github          https://github.com/arukateru
+// @id              uwp-clean-safe
+// @name            Safe UWP Process Cleanup
+// @description     Safely clean up idle ApplicationFrameHost processes without interfering with app launching.
+// @version         1.0
+// @author          Abhinav Chitrey
+// @github          https://github.com/chitreyAbhinav
 // @include         ApplicationFrameHost.exe
-// @include         RuntimeBroker.exe
-// @include         TextInputHost.exe
-// @include         SystemSettingsAdminFlows.exe
-// @include         ctfmon.exe
-// @compilerOptions -lcomdlg32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
+# Safe UWP Process Cleanup
 
-The Universal Windows Platform (UWP), in the spirit of being unoptimized, keep all of their many processes operating all of the time: at the logon of the user, RuntimeBroker automatically restarting, and even when UWP apps are closed. This mod makes ApplicationFrameHost and RuntimeBroker automatically terminate unless Settings or Windows Security are open. You can add to the list of apps to keep the programs open if you so choose.
+Safely cleans up idle ApplicationFrameHost.exe processes.
 
-**If you want to add more apps like WhatsApp etc to this list, you must turn off background processes for the app in the Metro Settings, or the app stays suspended.**
+## How it works
 
+- Only targets ApplicationFrameHost.exe.
+- Waits two minutes after the process starts.
+- Checks every 15 seconds.
+- Never terminates the process while it owns a visible window.
+- Performs a final safety check immediately before cleanup.
+
+## Processes NOT targeted
+
+- RuntimeBroker.exe
+- TextInputHost.exe
+- ctfmon.exe
+- SystemSettingsAdminFlows.exe
+
+The conservative design is intended to avoid interfering with
+Windows applications while reducing leftover ApplicationFrameHost
+processes.
+
+## Credits
+
+Inspired by the original "Clean up UWP processes" Windhawk mod
+by Alcatel.
+
+This version uses a substantially different and more conservative
+cleanup approach and targets only ApplicationFrameHost.exe.
 */
 // ==/WindhawkModReadme==
 
 #include <Windows.h>
-#include <iostream>
-#include <string>
-#include <thread>
-#include <TlHelp32.h>
+#include <atomic>
 
-bool IsProcessRunning(const std::wstring& processName) {
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32W);
-    if (!Process32FirstW(hSnap, &pe32)) {
-        CloseHandle(hSnap);
-        return false;
-    }
+// Wait two minutes after ApplicationFrameHost.exe starts
+// before cleanup is considered.
+constexpr DWORD GRACE_PERIOD_MS = 120000;
 
-    do {
-        if (pe32.szExeFile == processName) {
-            CloseHandle(hSnap);
-            return true;
-        }
-    } while (Process32NextW(hSnap, &pe32));
+// Check every 15 seconds after the grace period.
+constexpr DWORD CHECK_INTERVAL_MS = 15000;
 
-    CloseHandle(hSnap);
-    return false;
-}
+// ============================================================
+// GLOBAL VARIABLES
+// ============================================================
 
-void CheckProcesses() {
-    while (true) {
-        bool systemSettingsRunning = IsProcessRunning(L"SystemSettings.exe");
-        bool wduiRunning = IsProcessRunning(L"SecHealthUI.exe");
-        bool storeRunning = IsProcessRunning(L"WinStore.App.exe");
+std::atomic<bool> g_stopWorker{ false };
 
+HANDLE g_stopEvent = nullptr;
+HANDLE g_workerThread = nullptr;
 
-        if (!systemSettingsRunning && !wduiRunning && !storeRunning) {
+// ============================================================
+// WINDOW ENUMERATION DATA
+// ============================================================
 
-            ExitProcess(0);
-        }
+struct WindowCheckData
+{
+    DWORD processId;
+    bool hasVisibleWindow;
+};
 
-        std::this_thread::sleep_for(std::chrono::seconds(15));
-    }
-}
+// ============================================================
+// ENUMERATE WINDOWS
+// ============================================================
 
-BOOL APIENTRY DllMain(HMODULE hModule,
-    DWORD  ul_reason_for_call,
-    LPVOID lpReserved
-) {
-    switch (ul_reason_for_call)
+BOOL CALLBACK EnumWindowsProc(
+    HWND hwnd,
+    LPARAM lParam)
+{
+    WindowCheckData* data =
+        reinterpret_cast<WindowCheckData*>(lParam);
+
+    DWORD processId = 0;
+
+    GetWindowThreadProcessId(
+        hwnd,
+        &processId);
+
+    // Ignore windows belonging to other processes.
+    if (processId != data->processId)
+        return TRUE;
+
+    // If this process owns a visible window, it is currently
+    // being used and must not be terminated.
+    if (IsWindowVisible(hwnd))
     {
-    case DLL_PROCESS_ATTACH:
-        std::thread(CheckProcesses).detach();
-        break;
-    case DLL_THREAD_ATTACH:
-    case DLL_THREAD_DETACH:
-    case DLL_PROCESS_DETACH:
-        break;
+        data->hasVisibleWindow = true;
+
+        // We already found a visible window.
+        return FALSE;
     }
+
     return TRUE;
+}
+
+// ============================================================
+// CHECK WHETHER CURRENT PROCESS HAS A VISIBLE WINDOW
+// ============================================================
+
+bool CurrentProcessHasVisibleWindow()
+{
+    WindowCheckData data{};
+
+    data.processId = GetCurrentProcessId();
+    data.hasVisibleWindow = false;
+
+    EnumWindows(
+        EnumWindowsProc,
+        reinterpret_cast<LPARAM>(&data));
+
+    return data.hasVisibleWindow;
+}
+
+// ============================================================
+// CHECK WHETHER CLEANUP IS SAFE
+// ============================================================
+
+bool IsSafeToCleanup()
+{
+    // If ApplicationFrameHost currently owns a visible window,
+    // it is being used by an application.
+    if (CurrentProcessHasVisibleWindow())
+        return false;
+
+    return true;
+}
+
+// ============================================================
+// WORKER THREAD
+// ============================================================
+
+DWORD WINAPI WorkerThread(LPVOID)
+{
+    // Record when this ApplicationFrameHost process
+    // started running the mod.
+    const DWORD startTime = GetTickCount();
+
+    // ========================================================
+    // GRACE PERIOD
+    // ========================================================
+
+    while (!g_stopWorker)
+    {
+        DWORD elapsed =
+            GetTickCount() - startTime;
+
+        if (elapsed >= GRACE_PERIOD_MS)
+            break;
+
+        DWORD remaining =
+            GRACE_PERIOD_MS - elapsed;
+
+        DWORD waitTime =
+            (remaining < CHECK_INTERVAL_MS)
+                ? remaining
+                : CHECK_INTERVAL_MS;
+
+        DWORD result =
+            WaitForSingleObject(
+                g_stopEvent,
+                waitTime);
+
+        // Mod was disabled/unloaded.
+        if (result == WAIT_OBJECT_0)
+            return 0;
+    }
+
+    // ========================================================
+    // CLEANUP LOOP
+    // ========================================================
+
+    while (!g_stopWorker)
+    {
+        // Wait before checking again.
+        //
+        // Using an event instead of Sleep() allows the thread
+        // to stop immediately when the mod is disabled.
+        DWORD result =
+            WaitForSingleObject(
+                g_stopEvent,
+                CHECK_INTERVAL_MS);
+
+        // Mod was disabled/unloaded.
+        if (result == WAIT_OBJECT_0)
+            break;
+
+        // ----------------------------------------------------
+        // First safety check.
+        // ----------------------------------------------------
+
+        if (!IsSafeToCleanup())
+            continue;
+
+        // ----------------------------------------------------
+        // Final safety check.
+        //
+        // This reduces the chance of terminating the process
+        // just as an application is opening a window.
+        // ----------------------------------------------------
+
+        if (!IsSafeToCleanup())
+            continue;
+
+        // ----------------------------------------------------
+        // No visible window was found.
+        //
+        // This mod is loaded only into ApplicationFrameHost.exe,
+        // so ExitProcess() terminates only this target process.
+        // ----------------------------------------------------
+
+        ExitProcess(0);
+    }
+
+    return 0;
+}
+
+// ============================================================
+// WINDHAWK INITIALIZATION
+// ============================================================
+
+BOOL Wh_ModInit()
+{
+    g_stopWorker = false;
+
+    // Create a manual-reset event used to stop the worker.
+    g_stopEvent =
+        CreateEventW(
+            nullptr,
+            TRUE,
+            FALSE,
+            nullptr);
+
+    if (!g_stopEvent)
+        return FALSE;
+
+    // Start the worker thread.
+    //
+    // Wh_ModInit() is used instead of DllMain(), avoiding
+    // thread creation from inside DLL_PROCESS_ATTACH.
+    g_workerThread =
+        CreateThread(
+            nullptr,
+            0,
+            WorkerThread,
+            nullptr,
+            0,
+            nullptr);
+
+    if (!g_workerThread)
+    {
+        CloseHandle(g_stopEvent);
+
+        g_stopEvent = nullptr;
+
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// ============================================================
+// WINDHAWK UNINITIALIZATION
+// ============================================================
+
+void Wh_ModUninit()
+{
+    // Tell the worker to stop.
+    g_stopWorker = true;
+
+    // Wake the worker immediately.
+    if (g_stopEvent)
+    {
+        SetEvent(g_stopEvent);
+    }
+
+    // Wait for the worker to finish.
+    if (g_workerThread)
+    {
+        WaitForSingleObject(
+            g_workerThread,
+            3000);
+
+        CloseHandle(g_workerThread);
+
+        g_workerThread = nullptr;
+    }
+
+    // Close the stop event.
+    if (g_stopEvent)
+    {
+        CloseHandle(g_stopEvent);
+
+        g_stopEvent = nullptr;
+    }
 }
